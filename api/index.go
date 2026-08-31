@@ -2,7 +2,9 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -16,7 +18,7 @@ import (
 	"google.golang.org/genai"
 )
 
-const defaultModel = "gemini-2.5-flash-lite"
+const defaultModel = "gemini-2.5-flash"
 
 var (
 	once sync.Once
@@ -29,11 +31,25 @@ type TranslateRequest struct {
 	To             string `json:"to"`
 }
 
-func getAPIKey() string {
+func getAPIKey() (string, error) {
 	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
-		return key
+		return key, nil
 	}
-	return "AQ.Ab8RN6JZyiS0GSMh5vf56qfRjmt9lkLkdINKM5u6f6_ndSkQdw"
+	if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
+		return key, nil
+	}
+	return "", errors.New("missing API key: set GEMINI_API_KEY or GOOGLE_API_KEY in environment variables")
+}
+
+func newGenAIClient(ctx context.Context) (*genai.Client, error) {
+	apiKey, err := getAPIKey()
+	if err != nil {
+		return nil, err
+	}
+	return genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
 }
 
 func getMIMEType(filename string, fileBytes []byte) string {
@@ -55,7 +71,7 @@ func getMIMEType(filename string, fileBytes []byte) string {
 	if bytes.HasPrefix(fileBytes, []byte("RIFF")) && len(fileBytes) >= 12 && bytes.Contains(fileBytes[:12], []byte("WEBP")) {
 		return "image/webp"
 	}
-	return "image/png"
+	return "image/jpeg"
 }
 
 func extractJSON(raw string) string {
@@ -75,15 +91,12 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Welcome! Translation API is working."))
+	_, _ = w.Write([]byte("Welcome! Translation API is operational and ready."))
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  getAPIKey(),
-		Backend: genai.BackendGeminiAPI,
-	})
+	client, err := newGenAIClient(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"api_key_valid": false,
@@ -95,7 +108,11 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contents := []*genai.Content{
-		genai.NewContentFromParts([]*genai.Part{genai.NewPartFromText("ping")}, genai.RoleUser),
+		{
+			Parts: []*genai.Part{
+				{Text: "ping"},
+			},
+		},
 	}
 
 	_, err = client.Models.GenerateContent(ctx, defaultModel, contents, nil)
@@ -138,7 +155,7 @@ func handleTranslate(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if textInput := r.FormValue("text"); textInput != "" {
-			parts = append(parts, genai.NewPartFromText(fmt.Sprintf("Text to translate: %s", textInput)))
+			parts = append(parts, &genai.Part{Text: fmt.Sprintf("Text to translate: %s", textInput)})
 		}
 
 		file, header, err := r.FormFile("image")
@@ -147,7 +164,12 @@ func handleTranslate(w http.ResponseWriter, r *http.Request) {
 			fileBytes, err := io.ReadAll(file)
 			if err == nil && len(fileBytes) > 0 {
 				mimeType := getMIMEType(header.Filename, fileBytes)
-				parts = append(parts, genai.NewPartFromBytes(fileBytes, mimeType))
+				parts = append(parts, &genai.Part{
+					InlineData: &genai.Blob{
+						Data:     fileBytes,
+						MIMEType: mimeType,
+					},
+				})
 			}
 		}
 	} else {
@@ -163,7 +185,7 @@ func handleTranslate(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if req.Text != "" {
-			parts = append(parts, genai.NewPartFromText(fmt.Sprintf("Text to translate: %s", req.Text)))
+			parts = append(parts, &genai.Part{Text: fmt.Sprintf("Text to translate: %s", req.Text)})
 		}
 	}
 
@@ -176,11 +198,17 @@ func handleTranslate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instruction := fmt.Sprintf(`You are a professional translator and linguistic analyzer.
-Translate all text extracted from the provided input (image or text) accurately into %s.
-Identify the source language, script, and linguistic characteristics.
+	client, err := newGenAIClient(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 
-Return only valid JSON with this structure:
+	instruction := fmt.Sprintf(`You are a translation and linguistic analysis engine.
+Translate all text extracted from the provided input (image or text) accurately into %s.
+Extract the original text, detected language, and script.
+
+Return only valid JSON with this exact structure:
 {
   "detected_language": "",
   "detected_script": "",
@@ -194,18 +222,9 @@ Return only valid JSON with this structure:
   }
 }`, targetLang, targetLang)
 
-	promptParts := append([]*genai.Part{genai.NewPartFromText(instruction)}, parts...)
+	promptParts := append([]*genai.Part{{Text: instruction}}, parts...)
 	contents := []*genai.Content{
-		genai.NewContentFromParts(promptParts, genai.RoleUser),
-	}
-
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  getAPIKey(),
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+		{Parts: promptParts},
 	}
 
 	temp := float32(0.1)
