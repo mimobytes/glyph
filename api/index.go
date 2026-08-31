@@ -33,7 +33,7 @@ func getAPIKey() string {
 	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
 		return key
 	}
-	return "AIzaSyDuoaSb4koA4JBsY9g5gXUSYAFIMbVd_wA"
+	return "AQ.Ab8RN6KYLbeNfLii_TDoTmt2c7yO8NWMt3qMEbyFZkMDYjZL5w"
 }
 
 func getMIMEType(filename string, fileBytes []byte) string {
